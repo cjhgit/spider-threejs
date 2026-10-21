@@ -56,34 +56,85 @@ const lerp2 = (a, b, t) => V2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const mod = (a, n) => ((a % n) + n) % n;
 const smooth = t => t * t * (3 - 2 * t);
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const TAU = Math.PI * 2;
 const angDiff = (a, b) => {
-  let d = (a - b) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
+  let d = (a - b) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
   return d;
 };
 const approachAngle = (a, b, max) => a + clamp(angDiff(b, a), -max, max);
 
+function segIntersect(p0, p1, a, b) {
+  const rx = p1.x - p0.x, ry = p1.y - p0.y, sx = b.x - a.x, sy = b.y - a.y;
+  const den = rx * sy - ry * sx;
+  if (Math.abs(den) < 1e-12) return null;
+  const qx = a.x - p0.x, qy = a.y - p0.y;
+  const t = (qx * sy - qy * sx) / den, u = (qx * ry - qy * rx) / den;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+  return V2(p0.x + rx * t, p0.y + ry * t);
+}
+function nearestOnSeg(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+  const t = l2 > 0 ? clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / l2, 0, 1) : 0;
+  return { p: V2(a.x + dx * t, a.y + dy * t), t };
+}
+
+// ---------------- 折线 ----------------
+function mkPoly(pts) {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + dist(pts[i - 1], pts[i]));
+  return { p: pts, cum, L: cum[cum.length - 1] };
+}
+function sampleAt(P, s) {
+  const { p, cum } = P;
+  if (s <= 0) return V2(p[0].x, p[0].y);
+  if (s >= P.L) return V2(p[p.length - 1].x, p[p.length - 1].y);
+  let lo = 0, hi = cum.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= s) lo = m; else hi = m; }
+  const seg = cum[hi] - cum[lo];
+  return lerp2(p[lo], p[hi], seg > 0 ? (s - cum[lo]) / seg : 0);
+}
+function subPoly(P, d0, d1) {
+  const out = [sampleAt(P, d0)];
+  if (d1 >= d0) { for (let i = 0; i < P.p.length; i++) if (P.cum[i] > d0 + 1e-6 && P.cum[i] < d1 - 1e-6) out.push(V2(P.p[i].x, P.p[i].y)); }
+  else { for (let i = P.p.length - 1; i >= 0; i--) if (P.cum[i] < d0 - 1e-6 && P.cum[i] > d1 + 1e-6) out.push(V2(P.p[i].x, P.p[i].y)); }
+  out.push(sampleAt(P, d1));
+  return out;
+}
+function projectPoly(P, q) {
+  let best = { d: 0, dd: Infinity };
+  for (let i = 0; i < P.p.length - 1; i++) {
+    const n = nearestOnSeg(q, P.p[i], P.p[i + 1]), dd = dist(n.p, q);
+    if (dd < best.dd) best = { d: P.cum[i] + n.t * (P.cum[i + 1] - P.cum[i]), dd };
+  }
+  return best.d;
+}
+
 // ---------------- 全局状态 ----------------
-const N = 26;                       // 辐射丝数量
 const STY = {
-  thick: { w: 1.9, c: new THREE.Color(0x777777) },  // 桥线、框架、辐射丝
-  thin:  { w: 1.0, c: new THREE.Color(0x9c9c9c) },  // 螺旋丝
+  thick: { w: 1.9, c: new THREE.Color(0x777777), k: 0.016 },  // 桥线、框架、辐射丝
+  thin:  { w: 1.0, c: new THREE.Color(0x9c9c9c), k: 0.03 },   // 螺旋丝
 };
+const SLACK = 0.07;   // 正在拖出的丝比较松，下垂更多
 const WHITE = new THREE.Color(0xffffff);
 const BLACK = new THREE.Color(0x000000);
 const tmpC = new THREE.Color();
 
-const HIP_A = [0.45, 1.1, 1.95, 2.55];   // 髋关节在头胸部上的角度
-const FOOT_A = [0.6, 1.32, 2.02, 2.62];  // 静止时脚的方向
-const REACH = [30, 24, 23, 29];          // 髋到脚的静止距离
+const HIP_A = [0.45, 1.1, 1.95, 2.55];
+const FOOT_A = [0.6, 1.32, 2.02, 2.62];
+const REACH = [30, 24, 23, 29];
 const STEP_T = 0.14;
+const PIVOT = -7.5, ABD_LEN = 20.5;   // 腹柄位置、腹柄到纺器的长度（×S）
 
-let W, H, S, SPEED, SPIN, scene, camera, wd, poly, anchors;
-let segs, active, spider, legs, threadQ, legQ, bodyGroup, script, finished;
+let W, H, S, SPEED, SPIN, scene, camera, wd, N;
+let segs, active, spider, legs, threadQ, legQ, bodyGroup, abdomen, script, finished, grid;
+let frame, frameExt, corners, radPoly;
 let DT = 0;
 
-// ---------------- 动态四边形网格（画粗细可控的线） ----------------
+// ---------------- 动态四边形网格 ----------------
 function makeQuads(cap, z) {
   const pos = new Float32Array(cap * 12), col = new Float32Array(cap * 12), idx = new Uint32Array(cap * 6);
   for (let i = 0; i < cap; i++) { const o = i * 4; idx.set([o, o + 1, o + 2, o, o + 2, o + 3], i * 6); }
@@ -111,46 +162,46 @@ function quad(Q, ax, ay, bx, by, w, c, ext = 0) {
   for (let k = 0; k < 4; k++) { C[o + k * 3] = c.r; C[o + k * 3 + 1] = c.g; C[o + k * 3 + 2] = c.b; }
   Q.n++;
 }
+function polyQuads(Q, pts, w, c) {
+  for (let i = 0; i < pts.length - 1; i++) quad(Q, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y, w, c, w / 2);
+}
 function flush(Q) {
   Q.geo.attributes.position.needsUpdate = true;
   Q.geo.attributes.color.needsUpdate = true;
   Q.geo.setDrawRange(0, Q.n * 6);
 }
 
-// ---------------- 场景搭建 ----------------
+// ---------------- 场景 ----------------
 function init() {
   if (scene) scene.traverse(o => { o.geometry && o.geometry.dispose(); o.material && o.material.dispose(); });
   W = innerWidth; H = innerHeight;
   renderer.setSize(W, H);
   S = clamp(Math.min(W, H) / 720, 0.75, 1.6);
   SPEED = 85 * S;
-  SPIN = 28 * S;
+  SPIN = (ABD_LEN - PIVOT) * S;
 
   scene = new THREE.Scene();
   camera = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -10, 10);
 
   const pw = Math.max(14, 22 * S);
   const g = -H / 2, xL = -W / 4 + pw / 2, xR = W / 4 - pw / 2;
-  const y1 = H / 2 - H * 0.1, y2 = g + H * 0.28, cy = y1 - (y1 - g) * 0.42;
   wd = {
-    pw, g, xL, xR, y1, y2, off: 9 * S,
-    L1: V2(xL, y1), R1: V2(xR, y1), R2: V2(xR, y2), L2: V2(xL, y2),
-    G: V2(0, g), M: V2(0, y1), C: V2(0, cy),
+    pw, g, xL, xR, off: 9 * S,
+    pillars: [[-W / 4 - pw / 2, xL], [xR, W / 4 + pw / 2]],
+    y1L: H / 2 - H * rand(0.07, 0.15), y1R: H / 2 - H * rand(0.07, 0.15),
+    y2L: g + H * rand(0.2, 0.34), y2R: g + H * rand(0.2, 0.34),
+    C: V2(0, 0),
   };
 
   buildPillars();
-  buildPoly();
-  anchors = [];
-  for (let k = 0; k < N; k++) anchors.push(rayHit(wd.C, Math.PI / 2 + Math.PI * 2 * k / N));
-
-  segs = []; active = null;
-  threadQ = makeQuads(6000, 1);
+  segs = []; active = null; grid = new Map(); radPoly = []; N = 0;
+  threadQ = makeQuads(16000, 1);
   legQ = makeQuads(64, 3);
   scene.add(threadQ.mesh, legQ.mesh);
   bodyGroup = makeBody();
   scene.add(bodyGroup);
 
-  spider = { pos: V2(0, g + wd.off), prev: V2(0, g + wd.off), vel: V2(0, 0), heading: Math.PI, mode: 'surface' };
+  spider = { pos: V2(0, g + wd.off), prev: V2(0, g + wd.off), vel: V2(0, 0), heading: Math.PI, bend: 0, mode: 'surface' };
   initLegs();
   script = mainScript();
   finished = false;
@@ -174,107 +225,88 @@ function makeBody() {
   const grp = new THREE.Group();
   const geo = new THREE.CircleGeometry(1, 40);
   const mat = new THREE.MeshBasicMaterial({ color: 0x000000 });
-  const el = (rx, ry, x, y) => { const m = new THREE.Mesh(geo, mat); m.scale.set(rx, ry, 1); m.position.set(x, y, 0); grp.add(m); };
-  el(7 * S, 5.8 * S, 0, 0);            // 头胸部
-  el(4 * S, 3.6 * S, 5 * S, 0);        // 头部
-  el(2.4 * S, 1.8 * S, -7.5 * S, 0);   // 腹柄
-  el(11 * S, 8.5 * S, -17.5 * S, 0);   // 腹部
-  el(1.6 * S, 1.4 * S, -28 * S, 0);    // 纺器
+  const el = (parent, rx, ry, x, y) => { const m = new THREE.Mesh(geo, mat); m.scale.set(rx, ry, 1); m.position.set(x, y, 0); parent.add(m); };
+  el(grp, 7 * S, 5.8 * S, 0, 0);            // 头胸部
+  el(grp, 4 * S, 3.6 * S, 5 * S, 0);        // 头部
+  el(grp, 2.4 * S, 1.8 * S, PIVOT * S, 0);  // 腹柄
+  abdomen = new THREE.Group();              // 腹部可绕腹柄弯曲
+  abdomen.position.set(PIVOT * S, 0, 0);
+  el(abdomen, 11 * S, 8.5 * S, -10 * S, 0);
+  el(abdomen, 1.6 * S, 1.4 * S, -(ABD_LEN - 0.5) * S, 0);
+  grp.add(abdomen);
   grp.position.z = 4;
   return grp;
 }
 
-// ---------------- 框架多边形（逆时针参数化周长） ----------------
-function buildPoly() {
-  const V = [wd.L1, wd.R1, wd.R2, wd.G, wd.L2];
-  const len = [], cum = [];
-  let P = 0;
-  for (let i = 0; i < V.length; i++) { cum.push(P); const l = dist(V[i], V[(i + 1) % V.length]); len.push(l); P += l; }
-  poly = { V, len, cum, P };
-}
-function pointAtU(u) {
-  u = mod(u, poly.P);
-  for (let e = poly.V.length - 1; e >= 0; e--) {
-    if (u >= poly.cum[e]) return lerp2(poly.V[e], poly.V[(e + 1) % poly.V.length], (u - poly.cum[e]) / poly.len[e]);
-  }
-  return V2(poly.V[0].x, poly.V[0].y);
-}
-function rayHit(c, ang) {
-  const d = V2(Math.cos(ang), Math.sin(ang));
-  let best = null;
-  for (let e = 0; e < poly.V.length; e++) {
-    const A = poly.V[e], B = poly.V[(e + 1) % poly.V.length];
-    const ex = B.x - A.x, ey = B.y - A.y;
-    const den = d.x * ey - d.y * ex;
-    if (Math.abs(den) < 1e-9) continue;
-    const wx = A.x - c.x, wy = A.y - c.y;
-    const t = (wx * ey - wy * ex) / den, s = (wx * d.y - wy * d.x) / den;
-    if (t > 1e-6 && s >= -1e-6 && s <= 1 + 1e-6 && (!best || t < best.t)) {
-      const sc = clamp(s, 0, 1);
-      best = { t, p: lerp2(A, B, sc), u: poly.cum[e] + sc * poly.len[e] };
-    }
-  }
-  return best;
-}
-// 沿框架从 ua 走到 ub（取较短方向），返回途经的点
-function perimPath(ua, ub) {
-  const P = poly.P, df = mod(ub - ua, P), forward = df <= P / 2, span = forward ? df : P - df;
-  const mids = [];
-  poly.V.forEach((v, i) => {
-    const dv = forward ? mod(poly.cum[i] - ua, P) : mod(ua - poly.cum[i], P);
-    if (dv > 1e-6 && dv < span - 1e-6) mids.push([dv, v]);
-  });
-  mids.sort((a, b) => a[0] - b[0]);
-  return [pointAtU(ua), ...mids.map(m => V2(m[1].x, m[1].y)), pointAtU(ub)];
-}
-
-// ---------------- 蛛丝 ----------------
-function addSeg(a, b, type, meta) {
-  segs.push(Object.assign({ a: V2(a.x, a.y), b: V2(b.x, b.y), type, fade: 1, removing: false }, meta || {}));
-}
-function eatAux(sector, f) {
-  for (const s of segs) if (s.aux && !s.removing && s.sector === sector && s.f >= f - 0.004) s.removing = true;
-}
-function spinneret() {
-  const c = Math.cos(spider.heading), s = Math.sin(spider.heading);
-  return V2(spider.pos.x - c * SPIN, spider.pos.y - s * SPIN);
-}
-function spiralPts(k0, fA, fB, revs) {
-  const n = Math.max(1, Math.round(revs * N)), out = [], C = wd.C;
-  const Rin = Math.min(...anchors.map(a => dist(a.p, C)));
+// ---------------- 蛛丝（带重力下垂） ----------------
+function curvePts(a, b, k) {
+  const L = dist(a, b), n = clamp(Math.ceil(L / 18), 1, 40), h = k * Math.abs(b.x - a.x), out = [];
   for (let i = 0; i <= n; i++) {
-    const k = mod(k0 + i, N), f = fA + (fB - fA) * i / n, a = anchors[k].p, R = dist(a, C);
-    // 内圈接近圆形，越往外越贴合框架形状
-    const d = f * (Rin + (R - Rin) * f);
-    out.push({ x: C.x + (a.x - C.x) * d / R, y: C.y + (a.y - C.y) * d / R, k, f });
+    const t = i / n;
+    const x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t - 4 * h * t * (1 - t);
+    out.push(V2(clamp(x, wd.xL, wd.xR), Math.max(y, wd.g)));
   }
   return out;
 }
-// 纺器经过每根辐射丝时把螺旋丝粘上去
-function bindSpiral(pts, type, isCapture) {
-  for (let i = 1; i < pts.length - 1; i++) {
-    const prev = pts[i - 1], p = pts[i];
-    p.cb = () => {
-      addSeg(active.a, p, type, { aux: !isCapture && p.f > 0.1001, sector: prev.k, f: p.f });
-      active.a = V2(p.x, p.y);
-      if (isCapture) eatAux(prev.k, p.f);
-    };
+const CELL = 48;
+const cellKey = (cx, cy) => (cx + 2000) * 8192 + (cy + 2000);
+function gridAdd(seg) {
+  const P = seg.pts;
+  for (let i = 0; i < P.length - 1; i++) {
+    const a = P[i], b = P[i + 1], e = { seg, a, b };
+    const x0 = Math.floor(Math.min(a.x, b.x) / CELL), x1 = Math.floor(Math.max(a.x, b.x) / CELL);
+    const y0 = Math.floor(Math.min(a.y, b.y) / CELL), y1 = Math.floor(Math.max(a.y, b.y) / CELL);
+    for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
+      const key = cellKey(cx, cy);
+      let arr = grid.get(key);
+      if (!arr) grid.set(key, arr = []);
+      arr.push(e);
+    }
   }
 }
+function gridQuery(p, r, fn) {
+  const x0 = Math.floor((p.x - r) / CELL), x1 = Math.floor((p.x + r) / CELL);
+  const y0 = Math.floor((p.y - r) / CELL), y1 = Math.floor((p.y + r) / CELL);
+  for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
+    const arr = grid.get(cellKey(cx, cy));
+    if (arr) for (const e of arr) fn(e);
+  }
+}
+function addSeg(a, b, type, meta) {
+  const st = STY[type];
+  const seg = Object.assign({ a: V2(a.x, a.y), b: V2(b.x, b.y), type, k: SLACK, kT: st.k, fade: 1, removing: false }, meta || {});
+  seg.pts = curvePts(seg.a, seg.b, st.k);
+  segs.push(seg);
+  gridAdd(seg);
+  return seg;
+}
 
-// ---------------- 运动：路径与协程 ----------------
-// 地面 / 柱面上，身体中心与表面保持一点距离
+// ---------------- 蜘蛛身体几何 ----------------
+function toWorld(lx, ly) {
+  const c = Math.cos(spider.heading), s = Math.sin(spider.heading);
+  return V2(spider.pos.x + lx * c - ly * s, spider.pos.y + lx * s + ly * c);
+}
+function tip() {
+  const b = spider.bend;
+  return toWorld(PIVOT * S - Math.cos(b) * ABD_LEN * S, -Math.sin(b) * ABD_LEN * S);
+}
+// 丝的起点 / 终点永远是纺器当前所在的位置
+function beginThread(type, p = tip()) { active = { a: V2(p.x, p.y), type }; }
+function endThread(meta, p = tip()) {
+  if (!active) return null;
+  const s = addSeg(active.a, p, active.type, meta);
+  active = null;
+  return s;
+}
+
+// ---------------- 运动协程 ----------------
 function surf(p) {
-  const { xL, xR, g, off } = wd;
-  let x = p.x, y = p.y;
-  if (x <= xL + 0.5) x = xL + off; else if (x >= xR - 0.5) x = xR - off;
-  if (y <= g + 0.5) y = g + off;
-  const q = V2(x, y);
-  if (p.cb) q.cb = p.cb;
+  const q = V2(clamp(p.x, wd.xL, wd.xR), Math.max(p.y, wd.g + wd.off));
+  if (p.ev) q.evs = [p.ev];
   return q;
 }
 function buildPath(pts, r) {
-  const out = [V2(pts[0].x, pts[0].y)], markIdx = [];
+  const out = [V2(pts[0].x, pts[0].y)], vIdx = [0];
   for (let i = 1; i < pts.length - 1; i++) {
     const a = pts[i - 1], b = pts[i], c = pts[i + 1];
     const la = dist(a, b), lc = dist(b, c), rr = Math.min(r, la * 0.45, lc * 0.45);
@@ -282,23 +314,14 @@ function buildPath(pts, r) {
     for (let j = 0; j <= 6; j++) {
       const t = j / 6, u = 1 - t;
       out.push(V2(u * u * p1.x + 2 * u * t * b.x + t * t * p2.x, u * u * p1.y + 2 * u * t * b.y + t * t * p2.y));
-      if (j === 3 && b.cb) markIdx.push([out.length - 1, b.cb]);
+      if (j === 3) vIdx.push(out.length - 1);
     }
   }
-  const last = pts[pts.length - 1];
-  out.push(V2(last.x, last.y));
-  const cum = [0];
-  for (let i = 1; i < out.length; i++) cum.push(cum[i - 1] + dist(out[i - 1], out[i]));
-  return { p: out, cum, L: cum[cum.length - 1], marks: markIdx.map(([i, cb]) => ({ s: cum[i], cb })) };
-}
-function sampleAt(path, s) {
-  const { p, cum } = path;
-  if (s <= 0) return p[0];
-  if (s >= path.L) return p[p.length - 1];
-  let lo = 0, hi = cum.length - 1;
-  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= s) lo = m; else hi = m; }
-  const seg = cum[hi] - cum[lo];
-  return lerp2(p[lo], p[hi], seg > 0 ? (s - cum[lo]) / seg : 0);
+  out.push(V2(pts[pts.length - 1].x, pts[pts.length - 1].y));
+  vIdx.push(out.length - 1);
+  const P = mkPoly(out);
+  P.vS = vIdx.map(i => P.cum[i]);
+  return P;
 }
 function dirAngle(path, s, look) {
   const a = sampleAt(path, s), b = sampleAt(path, Math.min(path.L, s + look));
@@ -307,7 +330,6 @@ function dirAngle(path, s, look) {
 }
 
 function* wait(d) { let t = 0; while (t < d) { yield; t += DT; } }
-
 function* turnTo(a, rate = 2.6) {
   while (Math.abs(angDiff(a, spider.heading)) > 0.01) {
     yield;
@@ -315,16 +337,32 @@ function* turnTo(a, rate = 2.6) {
   }
   spider.heading = a;
 }
+// 把腹部压向地面，直到纺器触地
+function* bendToGround() {
+  spider.bend = 0.3; const yp = tip().y;
+  spider.bend = -0.3; const ym = tip().y;
+  spider.bend = 0;
+  const sgn = yp < ym ? 1 : -1;
+  while (tip().y > wd.g + 0.2 && Math.abs(spider.bend) < 1) { yield; spider.bend += sgn * 1.2 * DT; }
+}
+function* unbend() {
+  while (Math.abs(spider.bend) > 1e-3) { yield; spider.bend = approachAngle(spider.bend, 0, 1.2 * DT); }
+  spider.bend = 0;
+}
 
-// 沿折线行走；急转弯处停下来原地转身
+// 路径上的点可以带事件：
+//   s     纺器走到该点时触发（身体越过该点一个身长）
+//   b     身体走到该点时触发
+//   cross 纺器扫过某根辐射丝时触发，回调参数是交点
 function* walk(raw, opt = {}) {
   const pts = [];
   for (const r of raw) {
-    const p = surf(r);
-    if (pts.length && dist(pts[pts.length - 1], p) < 0.01) continue;
+    const p = surf(r), last = pts[pts.length - 1];
+    if (last && dist(last, p) < 0.5) { if (p.evs) last.evs = (last.evs || []).concat(p.evs); continue; }
     pts.push(p);
   }
-  if (pts.length < 2) return;
+  const ctx = { evs: [], ei: 0, travel: 0, vr: rand(0.93, 1.07) };
+  if (pts.length < 2) { for (const p of pts) for (const e of p.evs || []) e.cb(tip()); return; }
   const chunks = [[pts[0]]];
   for (let i = 1; i < pts.length; i++) {
     chunks[chunks.length - 1].push(pts[i]);
@@ -334,202 +372,416 @@ function* walk(raw, opt = {}) {
       if (turn > 1.25) chunks.push([pts[i]]);
     }
   }
-  for (let ci = 0; ci < chunks.length; ci++) {
-    yield* walkChunk(chunks[ci], opt);
-    const end = chunks[ci][chunks[ci].length - 1];
-    if (ci < chunks.length - 1 && end.cb) end.cb();
+  const paths = chunks.map(c => buildPath(c, 10 * S));
+  let off = 0;
+  paths.forEach((path, ci) => {
+    chunks[ci].forEach((p, j) => {
+      if (j === 0 && ci > 0) return;
+      for (const e of p.evs || []) ctx.evs.push(Object.assign({}, e, { at: off + path.vS[j] }));
+    });
+    off += path.L;
+  });
+  for (const path of paths) yield* walkChunk(path, opt, ctx);
+  while (ctx.ei < ctx.evs.length) ctx.evs[ctx.ei++].cb(tip());
+}
+function fireEvents(ctx, p0, p1) {
+  while (ctx.ei < ctx.evs.length) {
+    const e = ctx.evs[ctx.ei];
+    let hit = null;
+    if (e.kind === 'b') { if (ctx.travel >= e.at) hit = p1; }
+    else if (e.kind === 's') { if (ctx.travel - SPIN >= e.at) hit = p1; }
+    else {
+      for (let i = 0; i < e.poly.length - 1 && !hit; i++) hit = segIntersect(p0, p1, e.poly[i], e.poly[i + 1]);
+      if (!hit && ctx.travel - SPIN >= e.at + 15 * S) hit = p1;
+    }
+    if (!hit) break;
+    ctx.ei++;
+    e.cb(V2(hit.x, hit.y));
   }
 }
-function* walkChunk(pts, opt) {
-  const path = buildPath(pts, 10 * S);
-  if (path.L < 0.3) return;
+function* walkChunk(path, opt, ctx) {
+  const base = ctx.travel;
+  if (path.L < 0.3) { ctx.travel = base + path.L; const t = tip(); fireEvents(ctx, t, t); return; }
   const look = 12 * S;
   const a0 = dirAngle(path, 0, look);
   if (Math.abs(angDiff(a0, spider.heading)) > 0.3) yield* turnTo(a0);
   if (opt.mode) spider.mode = opt.mode;
-  const v = SPEED * (opt.speedK || 1);
-  let s = 0, t = 0, mi = 0;
+  const v = SPEED * (opt.speedK || 1) * ctx.vr;
+  let s = 0, t = 0, prevTip = tip();
   while (s < path.L) {
     yield;
     t += DT;
-    // 起步与停下时有短暂加减速，中途匀速
     const k = Math.min(1, 0.25 + t / 0.35, 0.25 + (path.L - s) / (v * 0.3));
     s = Math.min(path.L, s + v * k * DT);
     const p = sampleAt(path, s);
     spider.pos.x = p.x; spider.pos.y = p.y;
     if (path.L - s > 0.5) spider.heading = approachAngle(spider.heading, dirAngle(path, s, look), 5 * DT);
-    while (mi < path.marks.length && s - SPIN >= path.marks[mi].s) path.marks[mi++].cb();
+    ctx.travel = base + s;
+    const tp = tip();
+    fireEvents(ctx, prevTip, tp);
+    prevTip = tp;
   }
-  while (mi < path.marks.length) path.marks[mi++].cb();
 }
 
-// 腹部贴到 p 点固定丝线，之后丝线从纺器拉出
-function* startThread(p, type, dur = 0.3) {
-  active = { a: V2(p.x, p.y), type, end: V2(p.x, p.y) };
-  let t = 0;
-  while (t < dur) { yield; t += DT; active.end = lerp2(p, spinneret(), smooth(Math.min(1, t / dur))); }
-  active.end = null;
+// ---------------- 框架（闭合折线） ----------------
+function buildFrame(pts) {
+  const clean = [];
+  for (const p of pts) if (!clean.length || dist(clean[clean.length - 1], p) > 0.5) clean.push(V2(p.x, p.y));
+  if (dist(clean[0], clean[clean.length - 1]) < 0.5) clean.pop();
+  frame = mkPoly([...clean, clean[0]]);
+  frame.P = frame.L;
+  frameExt = mkPoly([...clean, ...clean, clean[0]]);
+  corners = [];
+  const n = clean.length;
+  for (let i = 0; i < n; i++) {
+    const a = clean[mod(i - 1, n)], b = clean[i], c = clean[(i + 1) % n];
+    const turn = Math.abs(angDiff(Math.atan2(c.y - b.y, c.x - b.x), Math.atan2(b.y - a.y, b.x - a.x)));
+    if (turn > 0.45) corners.push(frame.cum[i]);
+  }
 }
-// 腹部贴到 p 点把当前丝线固定，可选择从该点继续拉新丝
-function* attachEnd(p, cont = null, meta = null, dur = 0.35) {
-  if (!active) return;
-  const from = spinneret();
-  let t = 0;
-  while (t < dur) { yield; t += DT; active.end = lerp2(from, p, smooth(Math.min(1, t / dur))); }
-  addSeg(active.a, p, active.type, meta);
+function rayFrame(c, ang) {
+  const far = V2(c.x + Math.cos(ang) * 1e5, c.y + Math.sin(ang) * 1e5);
+  let best = null;
+  for (let i = 0; i < frame.p.length - 1; i++) {
+    const h = segIntersect(c, far, frame.p[i], frame.p[i + 1]);
+    if (h && (!best || dist(c, h) < best.t)) best = { t: dist(c, h), u: frame.cum[i] + dist(frame.p[i], h) };
+  }
+  return best;
+}
+// 锚点离框架拐角至少一个身长，蜘蛛越过锚点时不会绕到拐角另一边
+function avoidCorners(u, D) {
+  const P = frame.P;
+  for (let it = 0; it < 4; it++) {
+    let moved = false;
+    for (const c of corners) {
+      const dd = angDiffU(u, c, P);
+      if (Math.abs(dd) < D) { u = mod(c + (dd >= 0 ? D : -D), P); moved = true; }
+    }
+    if (!moved) return u;
+  }
+  return corners.every(c => Math.abs(angDiffU(u, c, P)) >= D - 1) ? u : null;
+}
+function angDiffU(u, c, P) { let d = mod(u - c, P); if (d > P / 2) d -= P; return d; }
+// 沿框架从 ua 走到 ub（较短方向），再继续往前走 ext
+function perimWalk(ua, ub, ext) {
+  const P = frame.P, a = mod(ua, P), df = mod(ub - ua, P);
+  if (df <= P / 2) return { to: subPoly(frameExt, a, a + df), ext: subPoly(frameExt, a + df, a + df + ext) };
+  const db = P - df;
+  return { to: subPoly(frameExt, a + P, a + P - db), ext: subPoly(frameExt, a + P - db, a + P - db - ext) };
+}
+
+// ---------------- 螺旋 ----------------
+let Rin = 1;
+function radAt(k, d) { const R = radPoly[k]; return sampleAt(R, Math.min(d, R.L * 0.97)); }
+function dOfF(k, f) { return f * (Rin + (radPoly[k].L - Rin) * f); }
+function spiralPoint(k, d, f) { const p = radAt(k, d); return { x: p.x, y: p.y, k, d, f }; }
+
+function* spiralWalk(seq, type, onRelay) {
+  const n = seq.length - 2;
+  const raw = [V2(spider.pos.x, spider.pos.y)];
+  for (let i = 0; i <= n; i++) {
+    const q = V2(seq[i].x, seq[i].y);
+    q.ev = { kind: 'cross', poly: radPoly[seq[i].k].p,
+      cb: i === 0 ? h => beginThread(type, h) : h => onRelay(i, h) };
+    raw.push(q);
+  }
+  const a = seq[n], b = seq[n + 1], e = (SPIN + 6 * S) / (dist(a, b) || 1);
+  raw.push(V2(a.x + (b.x - a.x) * e, a.y + (b.y - a.y) * e));
+  yield* walk(raw);
   active = null;
-  if (cont) yield* startThread(p, cont);
 }
 
-// ---------------- 结网脚本（真实圆网的建造顺序） ----------------
+// ---------------- 结网脚本 ----------------
 function* mainScript() {
-  const { g, xL, xR, L1, R1, R2, L2, G, M, C } = wd;
+  const { g, xL, xR } = wd;
   const P = () => V2(spider.pos.x, spider.pos.y);
+  const pause = () => wait(rand(0.2, 0.35));
 
   setPhase('准备中…');
-  yield* wait(1);
+  yield* wait(0.8);
 
   setPhase('① 架设桥线：爬上左柱固定丝线，拖着丝走到右柱并拉紧');
-  yield* walk([P(), V2(xL, g), L1]);
-  yield* startThread(L1, 'thick');
-  yield* walk([P(), V2(xL, g), V2(xR, g), R1]);
-  yield* attachEnd(R1);
+  yield* walk([P(), V2(xL, g), V2(xL, wd.y1L + SPIN)]);
+  yield* pause();
+  beginThread('thick');
+  yield* pause();
+  yield* walk([P(), V2(xL, g), V2(xR, g), V2(xR, wd.y1R + SPIN)]);
+  yield* pause();
+  const bridge = endThread();
   yield* wait(0.4);
 
   setPhase('② 沿桥线走到中点，固定后垂丝下降到地面，形成中轴线');
-  yield* walk([P(), M]);
-  yield* startThread(M, 'thick');
-  yield* turnTo(-Math.PI / 2);
-  yield* walk([P(), G], { mode: 'hang', speedK: 0.8 });
-  spider.mode = 'surface';
-  yield* attachEnd(G, 'thick');
-
-  setPhase('③ 搭建框架线：从地面锚点拉丝到两侧柱子');
-  yield* walk([P(), V2(xL, g), L2]);
-  yield* attachEnd(L2);
-  yield* walk([P(), G]);
-  yield* startThread(G, 'thick');
-  yield* walk([P(), V2(xR, g), R2]);
-  yield* attachEnd(R2);
-  yield* walk([P(), G, C]);
-
-  setPhase('④ 铺设辐射丝：从中心沿已有辐射丝出去，沿框架找到新锚点');
-  const built = [0, N / 2];
-  const kd = (i, j) => { const d = mod(i - j, N); return Math.min(d, N - d); };
-  let lastK = 0;
-  while (built.length < N) {
-    let best = -1, bestGap = -1, bestTie = -1;
-    for (let k = 0; k < N; k++) {
-      if (built.includes(k)) continue;
-      const gap = Math.min(...built.map(b => kd(k, b)));
-      const tie = kd(k, lastK);
-      if (gap > bestGap || (gap === bestGap && tie > bestTie)) { best = k; bestGap = gap; bestTie = tie; }
-    }
-    let nb = built[0];
-    for (const b of built) if (kd(best, b) < kd(best, nb)) nb = b;
-    yield* startThread(C, 'thick');
-    yield* walk([P(), ...perimPath(anchors[nb].u, anchors[best].u)]);
-    yield* attachEnd(anchors[best].p);
-    built.push(best);
-    lastK = best;
-    yield* walk([P(), C]);
-    yield* wait(0.15);
+  const bp = mkPoly(bridge.pts);
+  const dM = bp.L * rand(0.42, 0.58);
+  {
+    const to = subPoly(bp, bp.L, dM), ext = subPoly(bp, dM, dM - SPIN - 3 * S);
+    const tgt = to[to.length - 1];
+    tgt.ev = { kind: 's', cb: h => beginThread('thick', h) };
+    yield* walk([P(), V2(bridge.b.x, bridge.b.y), ...to.slice(1), ...ext.slice(1)]);
   }
+  const M = V2(active.a.x, active.a.y);
+  yield* pause();
+  yield* turnTo(-Math.PI / 2);
+  yield* walk([P(), V2(M.x, g)], { mode: 'hang', speedK: 0.75 });
+  spider.mode = 'surface';
+  yield* pause();
+  yield* turnTo(Math.PI);
+  yield* bendToGround();
+  const vertical = endThread();
+  beginThread('thick');
+  const G0 = V2(vertical.b.x, vertical.b.y);
+  yield* pause();
+  yield* unbend();
 
-  setPhase('⑤ 由内向外铺设辅助螺旋丝（临时脚手架）');
-  const hubPts = spiralPts(lastK, 0.045, 0.1, 2);
-  const auxPts = spiralPts(hubPts[hubPts.length - 1].k, 0.1, 0.8, 6.5);
-  const sp1 = hubPts.concat(auxPts.slice(1));
-  yield* walk([P(), sp1[0]]);
-  yield* startThread(sp1[0], 'thin');
-  bindSpiral(sp1, 'thin', false);
-  yield* walk([P(), ...sp1.slice(1)]);
-  const lastA = sp1[sp1.length - 1];
-  yield* attachEnd(lastA, null, { aux: true, sector: sp1[sp1.length - 2].k, f: lastA.f });
+  setPhase('③ 搭建框架线：从地面锚点分别拉丝到两侧柱子');
+  yield* walk([P(), V2(xL, g), V2(xL, wd.y2L + SPIN)]);
+  yield* pause();
+  const botL = endThread();
+  yield* pause();
+  const blp = mkPoly(botL.pts);
+  yield* walk([P(), V2(botL.b.x, botL.b.y), ...subPoly(blp, blp.L, 0).slice(1), V2(G0.x + SPIN + rand(8, 16) * S, g)]);
+  yield* bendToGround();
+  beginThread('thick');
+  yield* pause();
+  yield* unbend();
+  yield* walk([P(), V2(xR, g), V2(xR, wd.y2R + SPIN)]);
+  yield* pause();
+  const botR = endThread();
+  yield* pause();
 
-  setPhase('⑥ 由外向内铺设捕虫螺旋丝，同时拆除辅助螺旋丝');
-  const capPts = spiralPts(lastA.k, 0.9, 0.27, Math.round((0.9 - 0.27) / 0.027));
-  yield* walk([P(), capPts[0]]);
-  yield* startThread(capPts[0], 'thin');
-  bindSpiral(capPts, 'thin', true);
-  yield* walk([P(), ...capPts.slice(1)]);
-  yield* attachEnd(capPts[capPts.length - 1]);
-  for (const s of segs) if (s.aux) s.removing = true;
-  yield* walk([P(), C]);
+  const vp = mkPoly(vertical.pts);
+  const yC = M.y - (M.y - g) * rand(0.38, 0.46);
+  let dC = vp.L / 2;
+  for (let i = 0; i < vp.p.length - 1; i++) {
+    const a = vp.p[i], b = vp.p[i + 1];
+    if ((a.y - yC) * (b.y - yC) <= 0) { dC = vp.cum[i] + (a.y - yC) / ((a.y - b.y) || 1e-9) * (vp.cum[i + 1] - vp.cum[i]); break; }
+  }
+  const C = sampleAt(vp, dC);
+  wd.C = C;
+  const brp = mkPoly(botR.pts);
+  yield* walk([P(), V2(botR.b.x, botR.b.y), ...subPoly(brp, brp.L, 0).slice(1), V2(G0.x, g), ...subPoly(vp, vp.L, dC).slice(1)]);
+
+  setPhase('④ 铺设辐射丝：从中心沿已有辐射丝走到框架，在新位置固定后沿新丝返回');
+  buildFrame([...bridge.pts, botR.b, ...botR.pts.slice().reverse(), ...botL.pts]);
+  const thU = Math.atan2(M.y - C.y, M.x - C.x), thD = Math.atan2(G0.y - C.y, G0.x - C.x);
+  const spanL = mod(thD - thU, TAU), spanR = TAU - spanL;
+  const nL = randi(9, 13), nR = randi(9, 13), D = SPIN + 12 * S, E = SPIN + 4 * S;
+  const plan = [
+    { th: thU, built: true, poly: mkPoly(subPoly(vp, dC, 0)), u: projectPoly(frame, M) },
+    { th: thD, built: true, poly: mkPoly(subPoly(vp, dC, vp.L)), u: projectPoly(frame, G0) },
+  ];
+  const addTargets = (start, span, n) => {
+    for (let i = 1; i <= n; i++) {
+      const th = start + span * (i + rand(-0.3, 0.3)) / (n + 1);
+      const hit = rayFrame(C, th);
+      if (!hit) continue;
+      const u = avoidCorners(hit.u, D);
+      if (u === null) continue;
+      const p = sampleAt(frame, u);
+      plan.push({ th: Math.atan2(p.y - C.y, p.x - C.x), built: false, u });
+    }
+  };
+  addTargets(thU, spanL, nL);
+  addTargets(thD, spanR, nR);
+  plan.sort((a, b) => mod(a.th - thU, TAU) - mod(b.th - thU, TAU));
+  for (let i = 1; i < plan.length; i++) {
+    if (!plan[i].built && Math.abs(angDiff(plan[i].th, plan[i - 1].th)) < 0.08) plan.splice(i--, 1);
+  }
+  N = plan.length;
+  plan.forEach((r, k) => { if (r.built) radPoly[k] = r.poly; });
+
+  while (plan.some(r => !r.built)) {
+    let best = null, bestGap = -1;
+    for (const r of plan) {
+      if (r.built) continue;
+      const gap = Math.min(...plan.filter(q => q.built).map(q => Math.abs(angDiff(r.th, q.th)))) + rand(0, 0.05);
+      if (gap > bestGap) { bestGap = gap; best = r; }
+    }
+    let nb = null;
+    for (const q of plan) if (q.built && (!nb || Math.abs(angDiff(best.th, q.th)) < Math.abs(angDiff(best.th, nb.th)))) nb = q;
+    const k = plan.indexOf(best), kb = plan.indexOf(nb);
+
+    const hub = V2(C.x, C.y);
+    hub.ev = { kind: 's', cb: h => beginThread('thick', h) };
+    const pw = perimWalk(nb.u, best.u, E);
+    const tgt = pw.to[pw.to.length - 1];
+    tgt.ev = { kind: 's', cb: h => {
+      const seg = endThread(null, h);
+      radPoly[k] = mkPoly(seg.pts);
+      best.anchor = h;
+    } };
+    yield* walk([P(), hub, ...radPoly[kb].p.slice(1), ...pw.to, ...pw.ext.slice(1)]);
+    best.built = true;
+    yield* pause();
+    const back = pw.ext.slice().reverse();
+    yield* walk([P(), ...back.slice(1), best.anchor, ...radPoly[k].p.slice().reverse().slice(1), V2(C.x, C.y)]);
+    yield* wait(rand(0.1, 0.3));
+  }
+  Rin = Math.min(...radPoly.map(r => r.L));
+
+  setPhase('⑤ 先织中心，再由内向外铺设稀疏的辅助螺旋丝（临时脚手架）');
+  const k0 = randi(0, N - 1);
+  const seq = [];
+  {
+    let k = k0;
+    const hubSteps = Math.round(rand(2.2, 2.8) * N), d0 = 1.25 * SPIN, d1 = 2.1 * SPIN;
+    for (let i = 0; i <= hubSteps; i++) { seq.push(spiralPoint(k, d0 + (d1 - d0) * i / hubSteps, 0)); k = (k + 1) % N; }
+    let f = (d1 + 10 * S) / Rin, sp = rand(0.09, 0.13), n = 0;
+    const fEnd = rand(0.74, 0.82);
+    while (f < fEnd) {
+      const fj = f + rand(-0.004, 0.004);
+      seq.push(spiralPoint(k, dOfF(k, fj), fj));
+      k = (k + 1) % N; f += sp / N;
+      if (++n % N === 0) sp = rand(0.09, 0.13);
+    }
+    seq.push(spiralPoint(k, dOfF(k, f), f));
+    seq.hubEnd = hubSteps;
+  }
+  yield* walk([P(), ...subPoly(radPoly[k0], 0, seq[0].d).slice(1)]);
+  yield* spiralWalk(seq, 'thin', (i, h) => {
+    if (!active) return;
+    addSeg(active.a, h, 'thin', { aux: i > seq.hubEnd, idx: i, sector: seq[i - 1].k, f: seq[i].f });
+    active.a = h;
+  });
+  yield* pause();
+
+  setPhase('⑥ 由外向内铺设密集的捕虫螺旋丝，边走边拆除辅助螺旋丝');
+  const lastAux = seq[seq.length - 2];
+  const k1 = (lastAux.k + 1) % N;
+  const fCap0 = rand(0.86, 0.92), fCapEnd = rand(0.24, 0.3);
+  yield* walk([P(), ...subPoly(radPoly[k1], dOfF(k1, lastAux.f), dOfF(k1, fCap0))]);
+  const cap = [];
+  {
+    let k = k1, f = fCap0, sp = rand(0.022, 0.032), n = 0;
+    while (f > fCapEnd) {
+      const fj = f + rand(-0.003, 0.003);
+      cap.push(spiralPoint(k, dOfF(k, fj), fj));
+      k = (k + 1) % N; f -= sp / N;
+      if (++n % N === 0) sp = rand(0.022, 0.032);
+    }
+    cap.push(spiralPoint(k, dOfF(k, f), f));
+  }
+  yield* spiralWalk(cap, 'thin', (i, h) => {
+    if (!active) return;
+    addSeg(active.a, h, 'thin');
+    active.a = h;
+    const sector = cap[i - 1].k, f = cap[i].f;
+    for (const s of segs) if (s.aux && !s.removing && s.sector === sector && s.f >= f - 0.004) s.removing = true;
+  });
+  yield* pause();
+
+  setPhase('⑦ 沿剩余的辅助螺旋丝向中心走，边走边吃掉它');
+  const remain = segs.filter(s => s.aux && !s.removing).map(s => s.idx);
+  const kh = seq[seq.hubEnd].k;
+  const raw = [P()];
+  if (remain.length) {
+    const jmax = Math.max(...remain);
+    for (let i = jmax; i >= seq.hubEnd; i--) {
+      const q = V2(seq[i].x, seq[i].y);
+      if (i < jmax) {
+        const idx = i + 1;
+        q.ev = { kind: 'b', cb: () => { for (const s of segs) if (s.aux && s.idx === idx) s.removing = true; } };
+      }
+      raw.push(q);
+    }
+  } else raw.push(V2(seq[seq.hubEnd].x, seq[seq.hubEnd].y));
+  raw.push(...subPoly(radPoly[kh], seq[seq.hubEnd].d, 0).slice(1), V2(C.x, C.y));
+  yield* walk(raw);
   yield* turnTo(-Math.PI / 2);
   setPhase('完成：蜘蛛回到网中心，头朝下等待猎物');
 }
 
-// ---------------- 腿：步态 + 两段 IK ----------------
-function toWorld(lx, ly) {
-  const c = Math.cos(spider.heading), s = Math.sin(spider.heading);
-  return V2(spider.pos.x + lx * c - ly * s, spider.pos.y + lx * s + ly * c);
-}
+// ---------------- 腿：寻找真实落脚点 + 交替步态 + 两段 IK ----------------
 function hipLocal(l) { const r = 4.5 * S, a = HIP_A[l.i]; return [Math.cos(a) * r, l.side * Math.sin(a) * r]; }
+function hipWorld(l) { const [x, y] = hipLocal(l); return toWorld(x, y); }
+function legLen(l) { return REACH[l.i] * S * 1.3; }
 function legRest(l, k) {
   const [hx, hy] = hipLocal(l), a = FOOT_A[l.i], R = REACH[l.i] * S * k;
   return toWorld(hx + Math.cos(a) * R, hy + l.side * Math.sin(a) * R);
 }
-function clampFoot(p) { return V2(clamp(p.x, wd.xL, wd.xR), Math.max(p.y, wd.g)); }
-// 在地面或柱面上时，脚落在表面上
-function surfaceFoot(p) {
-  const { xL, xR, g, off } = wd, sp = spider.pos, c = [];
-  if (sp.y <= g + off + 1) c.push(V2(p.x, g));
-  if (Math.abs(sp.x - (xL + off)) < 1) c.push(V2(xL, p.y));
-  if (Math.abs(sp.x - (xR - off)) < 1) c.push(V2(xR, p.y));
-  if (!c.length) return clampFoot(p);
-  let best = c[0];
-  for (const q of c) if (dist(q, p) < dist(best, p)) best = q;
-  return clampFoot(best);
+// 落脚点只能是：地面、柱子表面、已经固定好的蛛丝
+function findFoothold(rest, hip, reach) {
+  let best = null, bd = Infinity, bseg = null;
+  const consider = (q, seg) => {
+    if (dist(q, hip) > reach) return;
+    const d = dist(q, rest);
+    if (d < bd) { bd = d; best = q; bseg = seg; }
+  };
+  consider(V2(rest.x, wd.g), null);
+  for (const [x0, x1] of wd.pillars) consider(V2(clamp(rest.x, x0, x1), clamp(rest.y, wd.g, H / 2)), null);
+  gridQuery(hip, reach, e => { if (!e.seg.removing) consider(nearestOnSeg(rest, e.a, e.b).p, e.seg); });
+  return best ? { p: best, seg: bseg } : null;
 }
 function initLegs() {
   legs = [];
   for (const side of [1, -1]) for (let i = 0; i < 4; i++) {
-    // 交替四足步态：左1右2左3右4 / 右1左2右3左4
-    const l = { side, i, group: ((i % 2) === 0) === (side === 1) ? 0 : 1, stepping: false, t: 0, from: null };
-    l.foot = surfaceFoot(legRest(l, 1));
+    const l = { side, i, group: ((i % 2) === 0) === (side === 1) ? 0 : 1, stepping: false, t: 0, free: true, seg: null, timer: 0 };
+    const rest = legRest(l, 1), fh = findFoothold(rest, hipWorld(l), legLen(l) * 0.95);
+    l.foot = fh ? fh.p : legRest(l, 0.68);
+    l.free = !fh;
+    l.plantVec = V2(l.foot.x - rest.x, l.foot.y - rest.y);
     legs.push(l);
   }
 }
+function startStep(l, fh) {
+  l.stepping = true; l.t = 0; l.from = V2(l.foot.x, l.foot.y);
+  if (fh) { l.to = fh.p; l.seg = fh.seg; l.toFree = false; }
+  else { l.to = null; l.seg = null; l.toFree = true; }
+}
 function updateLegs(dt) {
-  const sp = spider;
-  const k = Math.min(1, dt * 15);
+  const sp = spider, k = Math.min(1, dt * 15);
   sp.vel.x += ((sp.pos.x - sp.prev.x) / dt - sp.vel.x) * k;
   sp.vel.y += ((sp.pos.y - sp.prev.y) / dt - sp.vel.y) * k;
   sp.prev = V2(sp.pos.x, sp.pos.y);
   const thr = 7 * S;
   const busy = [false, false];
   for (const l of legs) if (l.stepping) busy[l.group] = true;
+  const ahead = (p) => V2(p.x + sp.vel.x * STEP_T * 0.9, p.y + sp.vel.y * STEP_T * 0.9);
   for (const l of legs) {
+    const rest = legRest(l, 1);
     if (sp.mode === 'hang') {
-      // 悬丝下降时腿收拢
-      const rest = legRest(l, 0.68), e = 1 - Math.exp(-12 * dt);
-      l.stepping = false;
-      l.foot = lerp2(l.foot, rest, e);
+      // 悬丝下降：腿收拢
+      l.stepping = false; l.free = true; l.seg = null;
+      l.foot = lerp2(l.foot, legRest(l, 0.68), 1 - Math.exp(-12 * dt));
       continue;
     }
-    const rest = legRest(l, 1);
-    const des = surfaceFoot(V2(rest.x + sp.vel.x * STEP_T * 0.6, rest.y + sp.vel.y * STEP_T * 0.6));
     if (l.stepping) {
       l.t += dt / STEP_T;
-      l.foot = lerp2(l.from, des, smooth(Math.min(1, l.t)));
-      if (l.t >= 1) l.stepping = false;
-    } else {
-      const d = dist(l.foot, des);
-      if ((d > thr && !busy[1 - l.group]) || d > thr * 3) {
-        l.stepping = true; l.t = 0; l.from = V2(l.foot.x, l.foot.y);
-        busy[l.group] = true;
+      const e = smooth(Math.min(1, l.t));
+      l.foot = lerp2(l.from, l.toFree ? legRest(l, 0.68) : l.to, e);
+      if (l.t >= 1) {
+        l.stepping = false;
+        l.free = l.toFree;
+        l.plantVec = V2(l.foot.x - rest.x, l.foot.y - rest.y);
       }
+      continue;
+    }
+    if (l.free) {
+      l.foot = lerp2(l.foot, legRest(l, 0.68), 1 - Math.exp(-12 * dt));
+      l.timer -= dt;
+      if (l.timer <= 0 && !busy[1 - l.group]) {
+        l.timer = 0.1;
+        const fh = findFoothold(ahead(rest), ahead(hipWorld(l)), legLen(l) * 0.95);
+        if (fh) { startStep(l, fh); busy[l.group] = true; }
+      }
+      continue;
+    }
+    const drift = Math.hypot(l.foot.x - rest.x - l.plantVec.x, l.foot.y - rest.y - l.plantVec.y);
+    const over = dist(hipWorld(l), l.foot) > legLen(l);
+    const lost = l.seg && l.seg.removing;
+    if ((drift > thr && !busy[1 - l.group]) || drift > thr * 2.5 || over || lost) {
+      startStep(l, findFoothold(ahead(rest), ahead(hipWorld(l)), legLen(l) * 0.95));
+      busy[l.group] = true;
     }
   }
 }
 function drawLegs() {
   legQ.n = 0;
   for (const l of legs) {
-    const [hx, hy] = hipLocal(l), hip = toWorld(hx, hy);
+    const hip = hipWorld(l);
     let f = l.foot;
     if (l.stepping) f = lerp2(f, hip, 0.16 * Math.sin(Math.PI * Math.min(1, l.t)));
-    const tot = REACH[l.i] * S * 1.3, l1 = tot * 0.47, l2 = tot * 0.53;
+    const tot = legLen(l), l1 = tot * 0.47, l2 = tot * 0.53;
     const d = clamp(dist(f, hip), Math.abs(l1 - l2) + 0.01, l1 + l2 - 0.01);
     const base = Math.atan2(f.y - hip.y, f.x - hip.x);
     const a = Math.acos(clamp((l1 * l1 + d * d - l2 * l2) / (2 * l1 * d), -1, 1));
@@ -552,12 +804,9 @@ function drawThreads() {
     const st = STY[s.type];
     let c = st.c, w = st.w;
     if (s.fade < 1) { c = tmpC.copy(st.c).lerp(WHITE, 1 - s.fade); w *= 0.5 + 0.5 * s.fade; }
-    quad(threadQ, s.a.x, s.a.y, s.b.x, s.b.y, w, c, w / 2);
+    polyQuads(threadQ, s.k > s.kT ? curvePts(s.a, s.b, s.k) : s.pts, w, c);
   }
-  if (active) {
-    const e = active.end || spinneret(), st = STY[active.type];
-    quad(threadQ, active.a.x, active.a.y, e.x, e.y, st.w, st.c, st.w / 2);
-  }
+  if (active) { const st = STY[active.type]; polyQuads(threadQ, curvePts(active.a, tip(), SLACK), st.w, st.c); }
   flush(threadQ);
 }
 
@@ -567,28 +816,32 @@ function step(h) {
   if (!finished && script.next().done) finished = true;
   updateLegs(h);
   let dead = false;
-  for (const s of segs) if (s.removing) { s.fade -= h * 1.8; if (s.fade <= 0) dead = true; }
+  for (const s of segs) {
+    if (s.k > s.kT) s.k = Math.max(s.kT, s.k - h * SLACK / 0.5);   // 固定后被拉紧
+    if (s.removing) { s.fade -= h * 2.5; if (s.fade <= 0) dead = true; }
+  }
   if (dead) segs = segs.filter(s => s.fade > 0);
 }
 let last = performance.now();
-function frame(now) {
+function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   let sim = dt * speedMul;
   while (sim > 1e-6) { const h = Math.min(sim, 1 / 120); sim -= h; step(h); }
   bodyGroup.position.set(spider.pos.x, spider.pos.y, 4);
   bodyGroup.rotation.z = spider.heading;
+  abdomen.rotation.z = spider.bend;
   drawThreads();
   drawLegs();
   renderer.render(scene, camera);
-  requestAnimationFrame(frame);
+  requestAnimationFrame(loop);
 }
 
 let resizeTimer = 0;
 addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(init, 300); });
 
 init();
-requestAnimationFrame(frame);
+requestAnimationFrame(loop);
 </script>
 </body>
 </html>
