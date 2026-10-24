@@ -126,7 +126,10 @@ const STY = {
 };
 const SLACK = 0.07;   // 正在拖出的丝比较松，下垂更多
 const WHITE = new THREE.Color(0xf2f2f2);
-const BLACK = new THREE.Color(0x000000);
+const LEG_FEMUR = new THREE.Color(0x141416); // 腿股节，近黑
+const LEG_TIBIA = new THREE.Color(0x3e424a); // 腿胫节，冷灰，和木柱的暖棕分开
+const PALP_BASE = new THREE.Color(0x4e545e); // 触肢
+const PALP_TIP = new THREE.Color(0x8e96a2);
 const tmpC = new THREE.Color();
 
 const HIP_A = [0.45, 1.1, 1.95, 2.55];
@@ -230,15 +233,23 @@ function buildPillars() {
 function makeBody() {
   const grp = new THREE.Group();
   const geo = new THREE.CircleGeometry(1, 40);
-  const mat = new THREE.MeshBasicMaterial({ color: 0x000000 });
-  const el = (parent, rx, ry, x, y) => { const m = new THREE.Mesh(geo, mat); m.scale.set(rx, ry, 1); m.position.set(x, y, 0); parent.add(m); };
-  el(grp, 7 * S, 5.8 * S, 0, 0);            // 头胸部
-  el(grp, 4 * S, 3.6 * S, 5 * S, 0);        // 头部
-  el(grp, 2.4 * S, 1.8 * S, PIVOT * S, 0);  // 腹柄
-  abdomen = new THREE.Group();              // 腹部可绕腹柄弯曲
+  // z 从后到前错开，重叠处才看得出分界
+  const el = (parent, rx, ry, x, y, color, z) => {
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color }));
+    m.scale.set(rx, ry, 1);
+    m.position.set(x, y, z);
+    parent.add(m);
+  };
+  el(grp, 7 * S, 5.8 * S, 0, 0, 0x2a2c32, 0.2);            // 头胸部
+  el(grp, 4 * S, 3.6 * S, 5 * S, 0, 0x555b66, 0.45);       // 头部
+  el(grp, 0.7 * S, 0.85 * S, 7.6 * S, 1.15 * S, 0xd8dce4, 0.6);
+  el(grp, 0.7 * S, 0.85 * S, 7.6 * S, -1.15 * S, 0xd8dce4, 0.6); // 眼
+  el(grp, 2.4 * S, 1.8 * S, PIVOT * S, 0, 0x0c0c0e, 0.35);  // 腹柄
+  abdomen = new THREE.Group();                              // 腹部可绕腹柄弯曲
   abdomen.position.set(PIVOT * S, 0, 0);
-  el(abdomen, 11 * S, 8.5 * S, -10 * S, 0);
-  el(abdomen, 1.6 * S, 1.4 * S, -(ABD_LEN - 0.5) * S, 0);
+  el(abdomen, 11 * S, 8.5 * S, -10 * S, 0, 0x101012, 0);   // 腹部，主体近黑
+  el(abdomen, 6.2 * S, 4.6 * S, -10.6 * S, 0, 0x32363e, 0.08); // 腹部冷灰斑
+  el(abdomen, 1.6 * S, 1.4 * S, -(ABD_LEN - 0.5) * S, 0, 0x9aa2ae, 0.25); // 纺器
   grp.add(abdomen);
   grp.position.z = 4;
   return grp;
@@ -843,13 +854,13 @@ function drawLegs() {
     const k1 = V2(hip.x + Math.cos(base + a) * l1, hip.y + Math.sin(base + a) * l1);
     const k2 = V2(hip.x + Math.cos(base - a) * l1, hip.y + Math.sin(base - a) * l1);
     const knee = dist(k1, spider.pos) > dist(k2, spider.pos) ? k1 : k2;
-    quad(legQ, hip.x, hip.y, knee.x, knee.y, 2.6 * S, BLACK, 1.3 * S);
-    quad(legQ, knee.x, knee.y, f.x, f.y, 1.7 * S, BLACK, 0.85 * S);
+    quad(legQ, hip.x, hip.y, knee.x, knee.y, 2.6 * S, LEG_FEMUR, 1.3 * S);
+    quad(legQ, knee.x, knee.y, f.x, f.y, 1.7 * S, LEG_TIBIA, 0.85 * S);
   }
   for (const sd of [1, -1]) {
     const a = toWorld(6 * S, sd * 2.2 * S), b = toWorld(10.5 * S, sd * 4.2 * S), c = toWorld(13 * S, sd * 2.8 * S);
-    quad(legQ, a.x, a.y, b.x, b.y, 1.8 * S, BLACK, 0.9 * S);
-    quad(legQ, b.x, b.y, c.x, c.y, 1.4 * S, BLACK, 0.7 * S);
+    quad(legQ, a.x, a.y, b.x, b.y, 1.8 * S, PALP_BASE, 0.9 * S);
+    quad(legQ, b.x, b.y, c.x, c.y, 1.4 * S, PALP_TIP, 0.7 * S);
   }
   flush(legQ);
 }
