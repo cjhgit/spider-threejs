@@ -345,6 +345,54 @@ function* bendToGround() {
   const sgn = yp < ym ? 1 : -1;
   while (tip().y > wd.g + 0.2 && Math.abs(spider.bend) < 1) { yield; spider.bend += sgn * 1.2 * DT; }
 }
+// 不移动身体时，腹部压到地面后纺器所在的 x
+function groundTipX() {
+  spider.bend = 0.3; const yp = tip().y;
+  spider.bend = -0.3; const ym = tip().y;
+  spider.bend = 0;
+  const sgn = yp < ym ? 1 : -1;
+  while (tip().y > wd.g + 0.2 && Math.abs(spider.bend) < 1) spider.bend += sgn * 0.002;
+  const x = tip().x;
+  spider.bend = 0;
+  return x;
+}
+// 从桥线松脚：先绕固定点摆到正下方，再受重力竖直放丝下降。丝始终从固定点垂到纺器。
+function* dropVertical(anchor, yFloor) {
+  spider.mode = 'hang';
+  spider.bend = 0;
+  let ang = Math.atan2(spider.pos.x - anchor.x, anchor.y - spider.pos.y);
+  let R = Math.max(dist(spider.pos, anchor), SPIN + 4 * S);
+  let w = 0, t = 0;
+  const gSwing = 2200 * S, damp = 3.4;
+  while (t < 3.5 && (Math.abs(ang) > 0.02 || Math.abs(w) > 0.08)) {
+    yield;
+    t += DT;
+    w += (-(gSwing / R) * Math.sin(ang) - damp * w) * DT;
+    ang += w * DT;
+    spider.pos.x = anchor.x + R * Math.sin(ang);
+    spider.pos.y = anchor.y - R * Math.cos(ang);
+    const hang = Math.atan2(spider.pos.y - anchor.y, spider.pos.x - anchor.x);
+    spider.heading = approachAngle(spider.heading, hang, 10 * DT);
+  }
+  spider.pos.x = anchor.x;
+  spider.pos.y = anchor.y - R;
+  spider.heading = -Math.PI / 2;
+
+  let vy = 0;
+  const gAcc = 2400 * S, vmax = 210 * S, yStop = yFloor + wd.off;
+  while (spider.pos.y > yStop + 0.5) {
+    yield;
+    vy = Math.min(vmax, vy + gAcc * DT);
+    const remain = spider.pos.y - yStop;
+    if (remain < vmax * 0.4) vy = Math.min(vy, Math.max(remain / 0.4, 50 * S));
+    spider.pos.y -= vy * DT;
+    spider.pos.x = anchor.x;
+    spider.heading = approachAngle(spider.heading, -Math.PI / 2, 8 * DT);
+  }
+  spider.pos.x = anchor.x;
+  spider.pos.y = yStop;
+  spider.heading = -Math.PI / 2;
+}
 function* unbend() {
   while (Math.abs(spider.bend) > 1e-3) { yield; spider.bend = approachAngle(spider.bend, 0, 1.2 * DT); }
   spider.bend = 0;
@@ -520,12 +568,13 @@ function* mainScript() {
     yield* walk([P(), V2(bridge.b.x, bridge.b.y), ...to.slice(1), ...ext.slice(1)]);
   }
   const M = V2(active.a.x, active.a.y);
-  yield* pause();
-  yield* turnTo(-Math.PI / 2);
-  yield* walk([P(), V2(M.x, g)], { mode: 'hang', speedK: 0.75 });
+  yield* wait(0.12);
+  yield* dropVertical(M, g);
   spider.mode = 'surface';
-  yield* pause();
+  yield* wait(0.15);
   yield* turnTo(Math.PI);
+  // 挪一小步，让纺器触地点正好在固定点正下方，中轴线保持竖直
+  yield* walk([P(), V2(spider.pos.x - (groundTipX() - M.x), g)]);
   yield* bendToGround();
   const vertical = endThread();
   beginThread('thick');
