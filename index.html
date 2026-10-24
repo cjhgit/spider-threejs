@@ -9,7 +9,9 @@
     font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
   canvas { display: block; }
   #ui { position: fixed; left: 12px; top: 10px; font-size: 13px; color: #666; user-select: none;
-    background: rgba(255, 255, 255, 0.85); padding: 6px 8px; border-radius: 6px; z-index: 1; }
+    background: rgba(255, 255, 255, 0.85); padding: 6px 8px; border-radius: 6px; z-index: 1;
+    opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+  #ui.show { opacity: 1; pointer-events: auto; }
   #phase { display: block; margin-bottom: 6px; }
   #ui button { font: inherit; font-size: 12px; margin-right: 4px; padding: 2px 8px; border: 1px solid #ccc;
     background: #fff; color: #555; border-radius: 4px; cursor: pointer; }
@@ -47,6 +49,10 @@ const speedBtns = SPEEDS.map(m => {
 });
 speedBtns[0].classList.add('on');
 document.getElementById('restart').onclick = () => init();
+const uiEl = document.getElementById('ui');
+const setUi = e => uiEl.classList.toggle('show', e.clientY < innerHeight / 2);
+addEventListener('mousemove', setUi);
+document.addEventListener('mouseleave', () => uiEl.classList.remove('show'));
 const setPhase = t => { phaseEl.textContent = t; };
 
 // ---------------- 数学工具 ----------------
